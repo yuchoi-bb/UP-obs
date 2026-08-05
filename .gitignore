@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+.pytest_cache/
+
+# 로컬 설정/자격증명/로그는 절대 커밋하지 않는다
+config.json
+*.log
