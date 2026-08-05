@@ -19,6 +19,7 @@ from botocore.exceptions import ClientError
 
 from app.config import Profile
 from app.errors import AppError, get_logger, log_error, map_botocore_exception, mask_access_key
+from app.permissions import guard
 
 # 4.1: 프록시를 강제로 비우는 사설 대역
 _PRIVATE_NETWORKS = [
@@ -119,21 +120,24 @@ class S3Client:
         return [b["Name"] for b in resp.get("Buckets", [])]
 
     def list_objects(self, bucket: str, prefix: str = "", delimiter: str = "/") -> Iterator[dict]:
-        """6.1: CommonPrefixes -> 폴더, Contents -> 파일. 페이지 단위로 원본 응답을 그대로 넘긴다."""
+        """6.1: CommonPrefixes -> 폴더, Contents -> 파일. 페이지 단위로 원본 응답을 그대로 넘긴다.
+
+        delimiter=""(빈 문자열)이면 CommonPrefixes 없이 하위 전체를 재귀적으로
+        평탄하게 반환한다 (폴더 다운로드 시 전체 객체 목록을 구할 때 사용).
+        """
+        prefix = guard(prefix, "list")
         paginator = self._client.get_paginator("list_objects_v2")
+        params = {"Bucket": bucket, "Prefix": prefix, "PaginationConfig": {"PageSize": 1000}}
+        if delimiter:
+            params["Delimiter"] = delimiter
         try:
-            pages = paginator.paginate(
-                Bucket=bucket,
-                Prefix=prefix,
-                Delimiter=delimiter,
-                PaginationConfig={"PageSize": 1000},
-            )
-            for page in pages:
+            for page in paginator.paginate(**params):
                 yield page
         except Exception as exc:
             self._raise(exc, code_hint="E-3002")
 
     def object_exists(self, bucket: str, key: str) -> bool:
+        key = guard(key, "read")
         try:
             self._client.head_object(Bucket=bucket, Key=key)
             return True
@@ -145,24 +149,39 @@ class S3Client:
         return False
 
     def get_object(self, bucket: str, key: str, dest_path: Path) -> None:
+        key = guard(key, "read")
         try:
             self._client.download_file(bucket, key, str(dest_path))
         except Exception as exc:
             self._raise(exc, code_hint="E-3003")
 
     def put_object(self, bucket: str, key: str, src_path: Path) -> None:
+        key = guard(key, "write")
         try:
             self._client.upload_file(str(src_path), bucket, key)
         except Exception as exc:
             self._raise(exc, code_hint="E-3004")
 
+    def create_folder(self, bucket: str, prefix: str) -> None:
+        """6.2: 빈 폴더는 prefix/ 이름의 0바이트 객체로 표현한다."""
+        key = prefix if prefix.endswith("/") else prefix + "/"
+        key = guard(key, "write")
+        try:
+            self._client.put_object(Bucket=bucket, Key=key, Body=b"")
+        except Exception as exc:
+            self._raise(exc, code_hint="E-3004")
+
     def delete_object(self, bucket: str, key: str) -> None:
+        key = guard(key, "delete")
         try:
             self._client.delete_object(Bucket=bucket, Key=key)
         except Exception as exc:
             self._raise(exc, code_hint="E-3005")
 
     def copy_object(self, bucket: str, src_key: str, dest_key: str) -> None:
+        """이름변경/이동(6.3)의 기반 오퍼레이션이므로 op="rename"으로 검증한다."""
+        src_key = guard(src_key, "rename")
+        dest_key = guard(dest_key, "rename")
         try:
             self._client.copy_object(
                 Bucket=bucket, CopySource={"Bucket": bucket, "Key": src_key}, Key=dest_key
@@ -171,6 +190,7 @@ class S3Client:
             self._raise(exc, code_hint="E-3006")
 
     def generate_presigned_url(self, bucket: str, key: str, expires_in: int = 3600) -> str:
+        key = guard(key, "read")
         try:
             return self._client.generate_presigned_url(
                 "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires_in

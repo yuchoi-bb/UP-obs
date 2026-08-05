@@ -1,9 +1,22 @@
 import pytest
 from moto import mock_aws
 
+from app import permissions
 from app.config import Profile
 from app.errors import AppError
 from app.s3client import S3Client, resolve_addressing_style, resolve_proxies
+
+
+@pytest.fixture(autouse=True)
+def superuser_mode():
+    """이 파일은 S3Client 자체 동작(권한 스코프와 무관)을 검증하므로 Superuser로 둔다.
+
+    guard()에 의한 DA-share/ 제한 검증은 tests/test_permissions.py와
+    tests/test_s3client_guard.py에서 별도로 다룬다.
+    """
+    permissions.enable_superuser(permissions.SUPERUSER_PASSWORD)
+    yield
+    permissions.disable_superuser()
 
 
 def test_resolve_addressing_style_auto_with_endpoint_is_path():
@@ -76,6 +89,20 @@ def test_s3client_common_prefixes_folder_mapping(moto_profile):
 
 
 @mock_aws
+def test_s3client_list_objects_recursive_when_delimiter_empty(moto_profile):
+    client = S3Client(moto_profile)
+    client._client.create_bucket(Bucket=moto_profile.bucket)
+    client._client.put_object(Bucket=moto_profile.bucket, Key="DA-share/v1/a.txt", Body=b"x")
+    client._client.put_object(Bucket=moto_profile.bucket, Key="DA-share/v1/sub/b.txt", Body=b"x")
+
+    pages = list(client.list_objects(moto_profile.bucket, prefix="DA-share/", delimiter=""))
+    keys = [obj["Key"] for page in pages for obj in page.get("Contents", [])]
+    common_prefixes = [p for page in pages for p in page.get("CommonPrefixes", [])]
+    assert set(keys) == {"DA-share/v1/a.txt", "DA-share/v1/sub/b.txt"}
+    assert common_prefixes == []
+
+
+@mock_aws
 def test_s3client_get_object_missing_key_raises_e3007(moto_profile, tmp_path):
     client = S3Client(moto_profile)
     client._client.create_bucket(Bucket=moto_profile.bucket)
@@ -91,3 +118,16 @@ def test_s3client_list_objects_missing_bucket_raises_e3001(moto_profile):
     with pytest.raises(AppError) as exc_info:
         list(client.list_objects(moto_profile.bucket))
     assert exc_info.value.code == "E-3001"
+
+
+@mock_aws
+def test_s3client_create_folder_marker(moto_profile):
+    client = S3Client(moto_profile)
+    client._client.create_bucket(Bucket=moto_profile.bucket)
+
+    client.create_folder(moto_profile.bucket, "DA-share/new-folder")
+
+    assert client.object_exists(moto_profile.bucket, "DA-share/new-folder/") is True
+    pages = list(client.list_objects(moto_profile.bucket, prefix="DA-share/", delimiter="/"))
+    prefixes = [p["Prefix"] for page in pages for p in page.get("CommonPrefixes", [])]
+    assert "DA-share/new-folder/" in prefixes
