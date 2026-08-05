@@ -1,15 +1,17 @@
 """메인 윈도우: 툴바 + 트리/목록 스플리터 + 상태바 (9장)."""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QThreadPool, QUrl, Qt
+from PySide6.QtCore import QObject, QThreadPool, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -18,9 +20,11 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QVBoxLayout,
+    QWidget,
 )
 
-from app import cache, permissions
+from app import cache, permissions, updater
 from app.config import ProfileStore
 from app.errors import AppError, get_log_dir
 from app.s3client import S3Client
@@ -38,6 +42,11 @@ from app.ui.transfer_worker import (
 from app.ui.tree_panel import TreePanel
 
 _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+_UPDATE_CHECK_DELAY_MS = 3000  # 11.1: 앱 시작 후 3초 뒤 백그라운드로 확인
+
+
+class _UpdateProgressSignal(QObject):
+    progress = Signal(int, int)
 
 
 class MainWindow(QMainWindow):
@@ -53,6 +62,8 @@ class MainWindow(QMainWindow):
         self._pool = QThreadPool.globalInstance()
         self._workers: set = set()
         self._transfer_manager: Optional[TransferManager] = None
+        self._pending_release: Optional[dict] = None
+        self._update_progress_signal: Optional[_UpdateProgressSignal] = None
 
         self._build_menu()
         self._build_toolbar()
@@ -63,6 +74,8 @@ class MainWindow(QMainWindow):
         if self._store.profiles:
             self._connect_profile(self._store.active_profile or self._store.profiles[0].name)
 
+        QTimer.singleShot(_UPDATE_CHECK_DELAY_MS, self._check_update_background)
+
     # ---- 구성 ---------------------------------------------------------
 
     def _build_menu(self) -> None:
@@ -71,6 +84,11 @@ class MainWindow(QMainWindow):
         self.superuser_action.setCheckable(True)
         self.superuser_action.toggled.connect(self._on_toggle_superuser)
         menu.addAction(self.superuser_action)
+
+        menu.addSeparator()
+        manual_update_action = QAction("업데이트 수동 확인", self)
+        manual_update_action.triggered.connect(self._check_update_manual)
+        menu.addAction(manual_update_action)
 
     def _build_toolbar(self) -> None:
         toolbar = self.addToolBar("메인")
@@ -99,6 +117,25 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(settings_btn)
 
     def _build_central(self) -> None:
+        container = QWidget()
+        outer_layout = QVBoxLayout(container)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        self.update_banner = QWidget()
+        self.update_banner.setVisible(False)
+        banner_layout = QHBoxLayout(self.update_banner)
+        self.update_banner_label = QLabel("")
+        banner_layout.addWidget(self.update_banner_label)
+        banner_layout.addStretch(1)
+        self.update_banner_button = QPushButton("지금 받기")
+        self.update_banner_button.clicked.connect(self._on_download_update_clicked)
+        banner_layout.addWidget(self.update_banner_button)
+        dismiss_btn = QPushButton("닫기")
+        dismiss_btn.clicked.connect(lambda: self.update_banner.setVisible(False))
+        banner_layout.addWidget(dismiss_btn)
+        outer_layout.addWidget(self.update_banner)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self.tree_panel = TreePanel()
@@ -118,7 +155,9 @@ class MainWindow(QMainWindow):
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
-        self.setCentralWidget(splitter)
+        outer_layout.addWidget(splitter)
+
+        self.setCentralWidget(container)
 
     def _build_statusbar(self) -> None:
         self.status_label = QLabel("연결 안 됨")
@@ -468,6 +507,99 @@ class MainWindow(QMainWindow):
         self._current_prefix = root
         self.tree_panel.set_client(self._client, bucket=self._current_bucket, root_prefix=root)
         self.object_table.load(self._current_bucket, root)
+
+    # ---- 자동 업데이트 (11장) -----------------------------------------------
+
+    def _check_update_background(self) -> None:
+        """11.1/11.4: 시작 3초 후 조용히 확인한다. 실패해도 대화상자를 띄우지 않는다."""
+        submit(
+            self._pool,
+            self._workers,
+            updater.fetch_latest_release,
+            on_result=self._on_background_check_result,
+            on_error=lambda _err: None,
+        )
+
+    def _on_background_check_result(self, release: dict) -> None:
+        if updater.is_newer(release.get("tag_name", "")):
+            self._show_update_banner(release)
+
+    def _check_update_manual(self) -> None:
+        """11.4: 수동 확인은 결과(성공/이미 최신/실패)를 명시적으로 보여준다."""
+        submit(
+            self._pool,
+            self._workers,
+            updater.fetch_latest_release,
+            on_result=self._on_manual_check_result,
+            on_error=self._show_error,
+        )
+
+    def _on_manual_check_result(self, release: dict) -> None:
+        tag = release.get("tag_name", "")
+        if updater.is_newer(tag):
+            self._show_update_banner(release)
+            QMessageBox.information(self, "업데이트 확인", f"{tag} 사용 가능 — 배너에서 받으세요.")
+        else:
+            QMessageBox.information(self, "업데이트 확인", "이미 최신 버전입니다.")
+
+    def _show_update_banner(self, release: dict) -> None:
+        self._pending_release = release
+        tag = release.get("tag_name", "")
+        self.update_banner_label.setText(f"{tag} 사용 가능 — 지금 받기")
+        self.update_banner_button.setEnabled(True)
+        self.update_banner.setVisible(True)
+
+    def _on_download_update_clicked(self) -> None:
+        if self._pending_release is None:
+            return
+        self.update_banner_button.setEnabled(False)
+        self.transfer_label.setVisible(True)
+        self.transfer_progress_bar.setVisible(True)
+        self.transfer_progress_bar.setRange(0, 100)
+        self.transfer_progress_bar.setValue(0)
+        self.transfer_label.setText("업데이트 다운로드 중...")
+
+        progress_signal = _UpdateProgressSignal()
+        progress_signal.progress.connect(self._on_update_progress)
+        self._update_progress_signal = progress_signal  # GC 방지
+
+        submit(
+            self._pool,
+            self._workers,
+            updater.perform_update,
+            os.getpid(),
+            self._pending_release,
+            progress_cb=lambda done, total: progress_signal.progress.emit(done, total),
+            on_result=self._on_update_ready,
+            on_error=self._on_update_download_failed,
+        )
+
+    def _on_update_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            self.transfer_progress_bar.setRange(0, total)
+            self.transfer_progress_bar.setValue(done)
+        self.transfer_label.setText(f"업데이트 다운로드 중... {format_size(done)}")
+
+    def _on_update_ready(self, script_path: Path) -> None:
+        self.transfer_label.setVisible(False)
+        self.transfer_progress_bar.setVisible(False)
+        self._update_progress_signal = None
+
+        reply = QMessageBox.question(
+            self, "업데이트 적용", "다운로드가 완료되었습니다. 지금 재시작해서 적용할까요?"
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self.update_banner_button.setEnabled(True)
+            return
+        updater.launch_updater(script_path)
+        self.close()
+
+    def _on_update_download_failed(self, err: AppError) -> None:
+        self.transfer_label.setVisible(False)
+        self.transfer_progress_bar.setVisible(False)
+        self._update_progress_signal = None
+        self.update_banner_button.setEnabled(True)
+        self._show_error(err)
 
     # ---- 오류 표시 (10.4) ---------------------------------------------------
 
