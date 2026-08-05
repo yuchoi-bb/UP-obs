@@ -119,16 +119,17 @@ class S3Client:
         return [b["Name"] for b in resp.get("Buckets", [])]
 
     def list_objects(self, bucket: str, prefix: str = "", delimiter: str = "/") -> Iterator[dict]:
-        """6.1: CommonPrefixes -> 폴더, Contents -> 파일. 페이지 단위로 원본 응답을 그대로 넘긴다."""
+        """6.1: CommonPrefixes -> 폴더, Contents -> 파일. 페이지 단위로 원본 응답을 그대로 넘긴다.
+
+        delimiter=""(빈 문자열)이면 CommonPrefixes 없이 하위 전체를 재귀적으로
+        평탄하게 반환한다 (폴더 다운로드 시 전체 객체 목록을 구할 때 사용).
+        """
         paginator = self._client.get_paginator("list_objects_v2")
+        params = {"Bucket": bucket, "Prefix": prefix, "PaginationConfig": {"PageSize": 1000}}
+        if delimiter:
+            params["Delimiter"] = delimiter
         try:
-            pages = paginator.paginate(
-                Bucket=bucket,
-                Prefix=prefix,
-                Delimiter=delimiter,
-                PaginationConfig={"PageSize": 1000},
-            )
-            for page in pages:
+            for page in paginator.paginate(**params):
                 yield page
         except Exception as exc:
             self._raise(exc, code_hint="E-3002")

@@ -5,6 +5,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from app import cache
 from app.config import ProfileStore
 from app.errors import AppError
 from app.ui.main_window import MainWindow
@@ -15,6 +16,8 @@ from app.ui.theme import STYLESHEET
 def main() -> int:
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
+
+    cache.clean_stale()  # 7.2: 7일 경과한 캐시 항목 정리
 
     store = ProfileStore()
     try:

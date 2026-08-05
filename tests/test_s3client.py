@@ -76,6 +76,20 @@ def test_s3client_common_prefixes_folder_mapping(moto_profile):
 
 
 @mock_aws
+def test_s3client_list_objects_recursive_when_delimiter_empty(moto_profile):
+    client = S3Client(moto_profile)
+    client._client.create_bucket(Bucket=moto_profile.bucket)
+    client._client.put_object(Bucket=moto_profile.bucket, Key="DA-share/v1/a.txt", Body=b"x")
+    client._client.put_object(Bucket=moto_profile.bucket, Key="DA-share/v1/sub/b.txt", Body=b"x")
+
+    pages = list(client.list_objects(moto_profile.bucket, prefix="DA-share/", delimiter=""))
+    keys = [obj["Key"] for page in pages for obj in page.get("Contents", [])]
+    common_prefixes = [p for page in pages for p in page.get("CommonPrefixes", [])]
+    assert set(keys) == {"DA-share/v1/a.txt", "DA-share/v1/sub/b.txt"}
+    assert common_prefixes == []
+
+
+@mock_aws
 def test_s3client_get_object_missing_key_raises_e3007(moto_profile, tmp_path):
     client = S3Client(moto_profile)
     client._client.create_bucket(Bucket=moto_profile.bucket)

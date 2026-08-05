@@ -2,25 +2,30 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QUrl, Qt
+from PySide6.QtCore import QThreadPool, QUrl, Qt
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
 )
 
+from app import cache
 from app.config import ProfileStore
 from app.errors import AppError, get_log_dir
 from app.s3client import S3Client
 from app.ui.object_table import ObjectTable, format_size
 from app.ui.settings_dialog import SettingsDialog
+from app.ui.transfer_worker import TransferManager, expand_download_items, expand_upload_paths, submit
 from app.ui.tree_panel import TreePanel
 
 _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
@@ -36,6 +41,9 @@ class MainWindow(QMainWindow):
         self._client: Optional[S3Client] = None
         self._current_bucket: str = ""
         self._current_prefix: str = ""
+        self._pool = QThreadPool.globalInstance()
+        self._workers: set = set()
+        self._transfer_manager: Optional[TransferManager] = None
 
         self._build_toolbar()
         self._build_central()
@@ -58,13 +66,11 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         self.upload_btn = QPushButton("↑업로드")
-        self.upload_btn.setEnabled(False)
-        self.upload_btn.setToolTip("3단계(드래그앤드롭)에서 지원 예정")
+        self.upload_btn.clicked.connect(self._on_upload_clicked)
         toolbar.addWidget(self.upload_btn)
 
         self.download_btn = QPushButton("↓받기")
-        self.download_btn.setEnabled(False)
-        self.download_btn.setToolTip("3단계(드래그앤드롭)에서 지원 예정")
+        self.download_btn.clicked.connect(self._on_download_clicked)
         toolbar.addWidget(self.download_btn)
 
         self.new_folder_btn = QPushButton("새폴더")
@@ -87,6 +93,7 @@ class MainWindow(QMainWindow):
         self.object_table.folder_activated.connect(self._on_path_selected)
         self.object_table.error_occurred.connect(self._show_error)
         self.object_table.listing_loaded.connect(self._on_listing_loaded)
+        self.object_table.files_dropped.connect(self._start_upload)
         splitter.addWidget(self.object_table)
 
         splitter.setStretchFactor(0, 1)
@@ -96,6 +103,20 @@ class MainWindow(QMainWindow):
     def _build_statusbar(self) -> None:
         self.status_label = QLabel("연결 안 됨")
         self.statusBar().addWidget(self.status_label)
+
+        self.transfer_label = QLabel("")
+        self.transfer_label.setVisible(False)
+        self.statusBar().addPermanentWidget(self.transfer_label)
+
+        self.transfer_progress_bar = QProgressBar()
+        self.transfer_progress_bar.setMaximumWidth(160)
+        self.transfer_progress_bar.setVisible(False)
+        self.statusBar().addPermanentWidget(self.transfer_progress_bar)
+
+        self.cancel_transfer_btn = QPushButton("취소")
+        self.cancel_transfer_btn.setVisible(False)
+        self.cancel_transfer_btn.clicked.connect(self._on_cancel_transfer)
+        self.statusBar().addPermanentWidget(self.cancel_transfer_btn)
 
     # ---- 프로파일 연결 --------------------------------------------------
 
@@ -170,6 +191,127 @@ class MainWindow(QMainWindow):
         self.object_table.load(self._current_bucket, self._current_prefix)
         self.tree_panel.refresh_node()
 
+    # ---- 전송: 업로드/다운로드 (7장, 8장) -----------------------------------
+
+    def _on_upload_clicked(self) -> None:
+        if self._client is None or not self._current_bucket:
+            QMessageBox.information(self, "업로드", "먼저 프로파일에 연결하고 위치를 선택하세요.")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "업로드할 파일 선택")
+        if not paths:
+            return
+        self._start_upload([Path(p) for p in paths])
+
+    def _start_upload(self, local_paths: list) -> None:
+        if self._client is None or not self._current_bucket:
+            QMessageBox.information(self, "업로드", "먼저 프로파일에 연결하고 위치를 선택하세요.")
+            return
+        if self._transfer_manager is not None and self._transfer_manager.is_running():
+            QMessageBox.information(self, "업로드", "다른 전송이 진행 중입니다. 완료 후 다시 시도하세요.")
+            return
+        bucket = self._current_bucket
+        prefix = self._current_prefix
+        submit(
+            self._pool,
+            self._workers,
+            expand_upload_paths,
+            local_paths,
+            bucket,
+            prefix,
+            on_result=lambda items: self._run_transfer("업로드", items),
+            on_error=self._show_error,
+        )
+
+    def _on_download_clicked(self) -> None:
+        if self._client is None:
+            QMessageBox.information(self, "받기", "먼저 프로파일에 연결하세요.")
+            return
+        selected = self.object_table.selected_keys()
+        if not selected:
+            QMessageBox.information(self, "받기", "다운로드할 항목을 선택하세요.")
+            return
+        if self._transfer_manager is not None and self._transfer_manager.is_running():
+            QMessageBox.information(self, "받기", "다른 전송이 진행 중입니다. 완료 후 다시 시도하세요.")
+            return
+        dest_dir = QFileDialog.getExistingDirectory(self, "받을 폴더 선택")
+        if not dest_dir:
+            return
+        client = self._client
+        bucket = self._current_bucket
+        submit(
+            self._pool,
+            self._workers,
+            expand_download_items,
+            client,
+            bucket,
+            selected,
+            Path(dest_dir),
+            on_result=lambda items: self._run_transfer("받기", items),
+            on_error=self._show_error,
+        )
+
+    def _run_transfer(self, label: str, items: list) -> None:
+        if not items:
+            QMessageBox.information(self, label, "전송할 항목이 없습니다.")
+            return
+        if self._client is None:
+            return
+        manager = TransferManager(max_concurrency=self._client.profile.max_concurrency)
+        self._transfer_manager = manager
+        manager.signals.progress.connect(lambda done, total, lbl=label: self._on_transfer_progress(lbl, done, total))
+        manager.signals.all_finished.connect(lambda results, lbl=label: self._on_transfer_finished(lbl, results))
+
+        self.transfer_label.setVisible(True)
+        self.transfer_progress_bar.setVisible(True)
+        self.transfer_progress_bar.setRange(0, len(items))
+        self.transfer_progress_bar.setValue(0)
+        self.transfer_label.setText(f"{label} 0/{len(items)}")
+        self.cancel_transfer_btn.setVisible(True)
+
+        manager.run(self._client, items)
+
+    def _on_transfer_progress(self, label: str, done: int, total: int) -> None:
+        self.transfer_progress_bar.setValue(done)
+        self.transfer_label.setText(f"{label} {done}/{total}")
+
+    def _on_cancel_transfer(self) -> None:
+        if self._transfer_manager is not None:
+            self._transfer_manager.cancel()
+
+    def _on_transfer_finished(self, label: str, results: list) -> None:
+        self.transfer_label.setVisible(False)
+        self.transfer_progress_bar.setVisible(False)
+        self.cancel_transfer_btn.setVisible(False)
+        self._transfer_manager = None
+
+        succeeded = [r for r in results if r.success]
+        cancelled = [r for r in results if not r.success and r.cancelled]
+        failed = [r for r in results if not r.success and not r.cancelled]
+
+        lines = [f"{label} 완료: 성공 {len(succeeded)}건"]
+        if cancelled:
+            lines.append(f"취소됨 {len(cancelled)}건")
+        if failed:
+            lines.append(f"실패 {len(failed)}건")
+            for r in failed[:10]:
+                lines.append(f"  - {r.item.key}: {r.error.display_text()}")
+            if len(failed) > 10:
+                lines.append(f"  ... 외 {len(failed) - 10}건")
+
+        box = QMessageBox(self)
+        box.setWindowTitle(f"{label} 결과")
+        box.setIcon(QMessageBox.Icon.Warning if failed else QMessageBox.Icon.Information)
+        box.setText("\n".join(lines))
+        open_log_btn = box.addButton("로그 폴더 열기", QMessageBox.ButtonRole.ActionRole) if failed else None
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if open_log_btn is not None and box.clickedButton() == open_log_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_log_dir())))
+
+        if self._current_bucket:
+            self.object_table.load(self._current_bucket, self._current_prefix)
+        self.tree_panel.refresh_node()
+
     # ---- 설정 -----------------------------------------------------------
 
     def _on_open_settings(self) -> None:
@@ -193,3 +335,11 @@ class MainWindow(QMainWindow):
         box.exec()
         if box.clickedButton() == open_log_btn:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_log_dir())))
+
+    # ---- 종료 (7.2: 캐시는 앱 종료 시 정리) -------------------------------
+
+    def closeEvent(self, event) -> None:
+        if self._transfer_manager is not None:
+            self._transfer_manager.cancel()
+        cache.clean_all()
+        super().closeEvent(event)
