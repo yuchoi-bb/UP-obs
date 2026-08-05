@@ -91,3 +91,16 @@ def test_s3client_list_objects_missing_bucket_raises_e3001(moto_profile):
     with pytest.raises(AppError) as exc_info:
         list(client.list_objects(moto_profile.bucket))
     assert exc_info.value.code == "E-3001"
+
+
+@mock_aws
+def test_s3client_create_folder_marker(moto_profile):
+    client = S3Client(moto_profile)
+    client._client.create_bucket(Bucket=moto_profile.bucket)
+
+    client.create_folder(moto_profile.bucket, "DA-share/new-folder")
+
+    assert client.object_exists(moto_profile.bucket, "DA-share/new-folder/") is True
+    pages = list(client.list_objects(moto_profile.bucket, prefix="DA-share/", delimiter="/"))
+    prefixes = [p["Prefix"] for page in pages for p in page.get("CommonPrefixes", [])]
+    assert "DA-share/new-folder/" in prefixes

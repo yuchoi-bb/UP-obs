@@ -156,6 +156,14 @@ class S3Client:
         except Exception as exc:
             self._raise(exc, code_hint="E-3004")
 
+    def create_folder(self, bucket: str, prefix: str) -> None:
+        """6.2: 빈 폴더는 prefix/ 이름의 0바이트 객체로 표현한다."""
+        key = prefix if prefix.endswith("/") else prefix + "/"
+        try:
+            self._client.put_object(Bucket=bucket, Key=key, Body=b"")
+        except Exception as exc:
+            self._raise(exc, code_hint="E-3004")
+
     def delete_object(self, bucket: str, key: str) -> None:
         try:
             self._client.delete_object(Bucket=bucket, Key=key)
