@@ -1,9 +1,22 @@
 import pytest
 from moto import mock_aws
 
+from app import permissions
 from app.config import Profile
 from app.errors import AppError
 from app.s3client import S3Client, resolve_addressing_style, resolve_proxies
+
+
+@pytest.fixture(autouse=True)
+def superuser_mode():
+    """이 파일은 S3Client 자체 동작(권한 스코프와 무관)을 검증하므로 Superuser로 둔다.
+
+    guard()에 의한 DA-share/ 제한 검증은 tests/test_permissions.py와
+    tests/test_s3client_guard.py에서 별도로 다룬다.
+    """
+    permissions.enable_superuser(permissions.SUPERUSER_PASSWORD)
+    yield
+    permissions.disable_superuser()
 
 
 def test_resolve_addressing_style_auto_with_endpoint_is_path():

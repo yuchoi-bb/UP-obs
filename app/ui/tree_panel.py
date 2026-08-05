@@ -30,17 +30,18 @@ class TreePanel(QWidget):
         self.tree.itemClicked.connect(self._on_item_clicked)
         layout.addWidget(self.tree)
 
-    def set_client(self, client: S3Client, bucket: str = "") -> None:
+    def set_client(self, client: S3Client, bucket: str = "", root_prefix: str = "") -> None:
+        """root_prefix: 5.1 - 일반 모드는 DA-share/, Superuser는 버킷 루트(빈 값)."""
         self._client = client
         self.tree.clear()
         if bucket:
-            self._add_bucket_root(bucket)
+            self._add_bucket_root(bucket, root_prefix)
         else:
             self._load_buckets()
 
-    def _add_bucket_root(self, bucket: str) -> QTreeWidgetItem:
+    def _add_bucket_root(self, bucket: str, root_prefix: str = "") -> QTreeWidgetItem:
         item = QTreeWidgetItem([bucket])
-        item.setData(0, Qt.ItemDataRole.UserRole, {"bucket": bucket, "prefix": "", "loaded": False})
+        item.setData(0, Qt.ItemDataRole.UserRole, {"bucket": bucket, "prefix": root_prefix, "loaded": False})
         self._add_placeholder(item)
         self.tree.addTopLevelItem(item)
         return item

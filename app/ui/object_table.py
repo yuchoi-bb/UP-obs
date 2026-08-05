@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QMimeData, QThreadPool, QUrl, Qt, Signal
-from PySide6.QtGui import QCursor, QDrag
+from PySide6.QtGui import QCursor, QDesktopServices, QDrag
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QHeaderView,
+    QMenu,
     QTableWidget,
     QTableWidgetItem,
     QToolTip,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from app.cache import cache_dir
 from app.errors import AppError
+from app.permissions import is_superuser
 from app.s3client import S3Client
 from app.ui.transfer_worker import submit
 
@@ -70,6 +72,9 @@ class ObjectTable(QWidget):
     error_occurred = Signal(object)  # AppError
     listing_loaded = Signal(int, int)  # file_count, total_bytes
     files_dropped = Signal(list)  # list[Path] - 7.1: 탐색기 -> 앱 업로드
+    download_requested = Signal(list)  # list[dict] - 컨텍스트 메뉴 "다운로드"
+    delete_requested = Signal(list)  # list[dict] - 컨텍스트 메뉴 "삭제" (Superuser 전용)
+    rename_requested = Signal(dict)  # 단일 항목 - 컨텍스트 메뉴 "이름변경" (Superuser 전용)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -87,6 +92,8 @@ class ObjectTable(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
         layout.addWidget(self.table)
 
     def set_client(self, client: S3Client) -> None:
@@ -258,3 +265,68 @@ class ObjectTable(QWidget):
             elif isinstance(outcome, AppError):
                 self.error_occurred.emit(outcome)
         return ok_paths
+
+    # ---- 9장: 컨텍스트 메뉴 ------------------------------------------------
+
+    def _on_context_menu(self, pos) -> None:
+        selected = self.selected_keys()
+        if not selected:
+            return
+        menu = self._build_context_menu(selected)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _build_context_menu(self, selected: list) -> QMenu:
+        menu = QMenu(self.table)
+        single = selected[0] if len(selected) == 1 else None
+
+        if single is not None and single["kind"] == "file":
+            open_action = menu.addAction("열기")
+            open_action.triggered.connect(lambda: self._open_selected(single))
+
+        download_action = menu.addAction("다운로드")
+        download_action.triggered.connect(lambda: self.download_requested.emit(selected))
+
+        # 5.1: 삭제/이름변경은 Superuser 전용. 버튼 숨김은 오조작 방지용이며
+        # 실제 차단은 s3client의 guard()가 담당한다 (버튼 숨김만으론 부족: 5.3).
+        if is_superuser():
+            menu.addSeparator()
+            if single is not None:
+                rename_action = menu.addAction("이름변경")
+                rename_action.triggered.connect(lambda: self.rename_requested.emit(single))
+            delete_action = menu.addAction("삭제")
+            delete_action.triggered.connect(lambda: self.delete_requested.emit(selected))
+
+        menu.addSeparator()
+        copy_path_action = menu.addAction("경로 복사")
+        copy_path_action.triggered.connect(lambda: self._copy_paths(selected))
+
+        files_only = [entry for entry in selected if entry["kind"] == "file"]
+        if files_only:
+            presign_action = menu.addAction("presigned URL 복사")
+            presign_action.triggered.connect(lambda: self._copy_presigned_urls(files_only))
+
+        return menu
+
+    def _open_selected(self, entry: dict) -> None:
+        local_paths = self._download_selection_to_cache([entry])
+        for path in local_paths:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _copy_paths(self, selected: list) -> None:
+        lines = []
+        for entry in selected:
+            key = entry["key"] if entry["kind"] == "file" else entry["prefix"]
+            lines.append(f"s3://{self.bucket}/{key}")
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _copy_presigned_urls(self, files: list) -> None:
+        if self._client is None:
+            return
+        urls = []
+        for entry in files:
+            try:
+                urls.append(self._client.generate_presigned_url(self.bucket, entry["key"]))
+            except AppError as exc:
+                self.error_occurred.emit(exc)
+                return
+        QApplication.clipboard().setText("\n".join(urls))

@@ -7,14 +7,18 @@ from pathlib import Path
 import pytest
 from moto import mock_aws
 
+from app import permissions
 from app.config import Profile
 from app.errors import AppError
 from app.s3client import S3Client
 from app.ui.transfer_worker import (
     TransferItem,
     TransferManager,
+    expand_delete_items,
     expand_download_items,
+    expand_rename_items,
     expand_upload_paths,
+    find_existing_keys,
 )
 
 BUCKET = "toolhub-objectstorage"
@@ -25,6 +29,17 @@ def pump(app, seconds: float = 3.0) -> None:
     while time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
+
+
+@pytest.fixture(autouse=True)
+def superuser_mode():
+    """delete/rename은 일반 모드에서 guard가 항상 막으므로, 이 파일은 Superuser로 둔다.
+
+    권한 스코프 자체의 검증은 tests/test_permissions.py, tests/test_s3client_guard.py 참고.
+    """
+    permissions.enable_superuser(permissions.SUPERUSER_PASSWORD)
+    yield
+    permissions.disable_superuser()
 
 
 @pytest.fixture
@@ -153,3 +168,84 @@ def test_transfer_manager_cancel_stops_pending_items(qapp, client, tmp_path, mon
     assert len(results) == 3
     cancelled = [r for r in results if r.cancelled]
     assert len(cancelled) >= 1  # 첫 항목 실행 중 취소 -> 뒤 항목들은 시작 전에 취소됨
+
+
+def test_find_existing_keys_detects_conflicts(client, tmp_path):
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/exists.txt", Body=b"old")
+    new_file = tmp_path / "exists.txt"
+    new_file.write_text("new")
+    other_file = tmp_path / "fresh.txt"
+    other_file.write_text("fresh")
+
+    items = [
+        TransferItem(kind="upload", bucket=BUCKET, key="DA-share/exists.txt", local_path=new_file),
+        TransferItem(kind="upload", bucket=BUCKET, key="DA-share/fresh.txt", local_path=other_file),
+    ]
+    existing = find_existing_keys(client, items)
+    assert existing == {"DA-share/exists.txt"}
+
+
+def test_expand_delete_items_file_and_folder(client):
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/a.txt", Body=b"x")
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/builds/", Body=b"")
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/builds/tool.zip", Body=b"x")
+
+    selected = [
+        {"kind": "file", "key": "DA-share/a.txt"},
+        {"kind": "folder", "prefix": "DA-share/builds/"},
+    ]
+    items = expand_delete_items(client, BUCKET, selected)
+    keys = {item.key for item in items}
+    assert keys == {"DA-share/a.txt", "DA-share/builds/", "DA-share/builds/tool.zip"}
+    assert all(item.kind == "delete" for item in items)
+
+
+def test_expand_rename_items_file():
+    items = expand_rename_items(None, BUCKET, {"kind": "file", "key": "DA-share/old.txt"}, "new.txt")
+    assert len(items) == 1
+    assert items[0].kind == "rename"
+    assert items[0].src_key == "DA-share/old.txt"
+    assert items[0].key == "DA-share/new.txt"
+
+
+def test_expand_rename_items_folder_recurses(client):
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/v1/", Body=b"")
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/v1/a.txt", Body=b"x")
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/v1/sub/b.txt", Body=b"x")
+
+    items = expand_rename_items(client, BUCKET, {"kind": "folder", "prefix": "DA-share/v1/"}, "v2")
+    mapping = {item.src_key: item.key for item in items}
+    assert mapping == {
+        "DA-share/v1/": "DA-share/v2/",
+        "DA-share/v1/a.txt": "DA-share/v2/a.txt",
+        "DA-share/v1/sub/b.txt": "DA-share/v2/sub/b.txt",
+    }
+
+
+def test_transfer_manager_delete_item(qapp, client):
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/to-delete.txt", Body=b"x")
+    manager = TransferManager(max_concurrency=1)
+    finished = {}
+    manager.signals.all_finished.connect(lambda results: finished.setdefault("results", results))
+
+    manager.run(client, [TransferItem(kind="delete", bucket=BUCKET, key="DA-share/to-delete.txt")])
+    pump(qapp, 2.0)
+
+    assert finished["results"][0].success is True
+    assert client.object_exists(BUCKET, "DA-share/to-delete.txt") is False
+
+
+def test_transfer_manager_rename_item(qapp, client):
+    client._client.put_object(Bucket=BUCKET, Key="DA-share/old.txt", Body=b"content")
+    manager = TransferManager(max_concurrency=1)
+    finished = {}
+    manager.signals.all_finished.connect(lambda results: finished.setdefault("results", results))
+
+    manager.run(
+        client, [TransferItem(kind="rename", bucket=BUCKET, key="DA-share/new.txt", src_key="DA-share/old.txt")]
+    )
+    pump(qapp, 2.0)
+
+    assert finished["results"][0].success is True
+    assert client.object_exists(BUCKET, "DA-share/old.txt") is False
+    assert client.object_exists(BUCKET, "DA-share/new.txt") is True

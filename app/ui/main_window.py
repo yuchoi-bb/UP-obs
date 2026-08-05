@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QThreadPool, QUrl, Qt
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -19,13 +20,21 @@ from PySide6.QtWidgets import (
     QSplitter,
 )
 
-from app import cache
+from app import cache, permissions
 from app.config import ProfileStore
 from app.errors import AppError, get_log_dir
 from app.s3client import S3Client
 from app.ui.object_table import ObjectTable, format_size
 from app.ui.settings_dialog import SettingsDialog
-from app.ui.transfer_worker import TransferManager, expand_download_items, expand_upload_paths, submit
+from app.ui.transfer_worker import (
+    TransferManager,
+    expand_delete_items,
+    expand_download_items,
+    expand_rename_items,
+    expand_upload_paths,
+    find_existing_keys,
+    submit,
+)
 from app.ui.tree_panel import TreePanel
 
 _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
@@ -45,6 +54,7 @@ class MainWindow(QMainWindow):
         self._workers: set = set()
         self._transfer_manager: Optional[TransferManager] = None
 
+        self._build_menu()
         self._build_toolbar()
         self._build_central()
         self._build_statusbar()
@@ -54,6 +64,13 @@ class MainWindow(QMainWindow):
             self._connect_profile(self._store.active_profile or self._store.profiles[0].name)
 
     # ---- 구성 ---------------------------------------------------------
+
+    def _build_menu(self) -> None:
+        menu = self.menuBar().addMenu("메뉴")
+        self.superuser_action = QAction("관리자 모드", self)
+        self.superuser_action.setCheckable(True)
+        self.superuser_action.toggled.connect(self._on_toggle_superuser)
+        menu.addAction(self.superuser_action)
 
     def _build_toolbar(self) -> None:
         toolbar = self.addToolBar("메인")
@@ -94,6 +111,9 @@ class MainWindow(QMainWindow):
         self.object_table.error_occurred.connect(self._show_error)
         self.object_table.listing_loaded.connect(self._on_listing_loaded)
         self.object_table.files_dropped.connect(self._start_upload)
+        self.object_table.download_requested.connect(self._download_items)
+        self.object_table.delete_requested.connect(self._on_delete_requested)
+        self.object_table.rename_requested.connect(self._on_rename_requested)
         splitter.addWidget(self.object_table)
 
         splitter.setStretchFactor(0, 1)
@@ -103,6 +123,11 @@ class MainWindow(QMainWindow):
     def _build_statusbar(self) -> None:
         self.status_label = QLabel("연결 안 됨")
         self.statusBar().addWidget(self.status_label)
+
+        self.superuser_badge = QLabel("SUPERUSER")
+        self.superuser_badge.setProperty("role", "badge-superuser")
+        self.superuser_badge.setVisible(False)
+        self.statusBar().addWidget(self.superuser_badge)
 
         self.transfer_label = QLabel("")
         self.transfer_label.setVisible(False)
@@ -148,13 +173,14 @@ class MainWindow(QMainWindow):
 
         self._client = client
         self._store.active_profile = name
-        self.tree_panel.set_client(client, bucket=profile.bucket)
+        root = permissions.root_prefix()
+        self.tree_panel.set_client(client, bucket=profile.bucket, root_prefix=root)
         self.object_table.set_client(client)
         self._current_bucket = profile.bucket
-        self._current_prefix = ""
+        self._current_prefix = root
         self.status_label.setText(f"연결됨 · {profile.endpoint_url or 'AWS'}")
         if profile.bucket:
-            self.object_table.load(profile.bucket, "")
+            self.object_table.load(profile.bucket, root)
 
     # ---- 트리/목록 상호작용 ----------------------------------------------
 
@@ -218,9 +244,36 @@ class MainWindow(QMainWindow):
             local_paths,
             bucket,
             prefix,
-            on_result=lambda items: self._run_transfer("업로드", items),
+            on_result=self._on_upload_items_expanded,
             on_error=self._show_error,
         )
+
+    def _on_upload_items_expanded(self, items: list) -> None:
+        if not items or self._client is None:
+            self._run_transfer("업로드", items)
+            return
+        submit(
+            self._pool,
+            self._workers,
+            find_existing_keys,
+            self._client,
+            items,
+            on_result=lambda existing: self._confirm_overwrite_and_upload(items, existing),
+            on_error=self._show_error,
+        )
+
+    def _confirm_overwrite_and_upload(self, items: list, existing_keys: set) -> None:
+        """5.4: 동일 키 업로드는 실질적 삭제와 같으므로 덮어쓰기 전 확인한다. 취소 시 해당 항목만 건너뜀."""
+        filtered = []
+        for item in items:
+            if item.kind == "upload" and item.key in existing_keys:
+                reply = QMessageBox.question(
+                    self, "덮어쓰기 확인", f"'{item.key}' 항목이 이미 있습니다. 덮어쓸까요?"
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    continue
+            filtered.append(item)
+        self._run_transfer("업로드", filtered)
 
     def _on_download_clicked(self) -> None:
         if self._client is None:
@@ -229,6 +282,11 @@ class MainWindow(QMainWindow):
         selected = self.object_table.selected_keys()
         if not selected:
             QMessageBox.information(self, "받기", "다운로드할 항목을 선택하세요.")
+            return
+        self._download_items(selected)
+
+    def _download_items(self, selected: list) -> None:
+        if self._client is None or not selected:
             return
         if self._transfer_manager is not None and self._transfer_manager.is_running():
             QMessageBox.information(self, "받기", "다른 전송이 진행 중입니다. 완료 후 다시 시도하세요.")
@@ -247,6 +305,62 @@ class MainWindow(QMainWindow):
             selected,
             Path(dest_dir),
             on_result=lambda items: self._run_transfer("받기", items),
+            on_error=self._show_error,
+        )
+
+    def _on_delete_requested(self, selected: list) -> None:
+        """5.1: 삭제는 Superuser 전용. guard()가 최종 방어선이므로 여기서도 확인만 하고 그대로 흘려보낸다."""
+        if self._client is None or not selected:
+            return
+        if self._transfer_manager is not None and self._transfer_manager.is_running():
+            QMessageBox.information(self, "삭제", "다른 전송이 진행 중입니다. 완료 후 다시 시도하세요.")
+            return
+        reply = QMessageBox.question(self, "삭제 확인", f"{len(selected)}개 항목을 삭제할까요? 되돌릴 수 없습니다.")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        client = self._client
+        bucket = self._current_bucket
+        submit(
+            self._pool,
+            self._workers,
+            expand_delete_items,
+            client,
+            bucket,
+            selected,
+            on_result=lambda items: self._run_transfer("삭제", items),
+            on_error=self._show_error,
+        )
+
+    def _on_rename_requested(self, entry: dict) -> None:
+        """5.1: 이름변경은 Superuser 전용. 6.3: CopyObject 후 DeleteObject, 폴더는 하위 전체 순회."""
+        if self._client is None:
+            return
+        if self._transfer_manager is not None and self._transfer_manager.is_running():
+            QMessageBox.information(self, "이름변경", "다른 전송이 진행 중입니다. 완료 후 다시 시도하세요.")
+            return
+        current_name = (
+            entry["key"].rsplit("/", 1)[-1]
+            if entry["kind"] == "file"
+            else entry["prefix"].rstrip("/").rsplit("/", 1)[-1]
+        )
+        new_name, ok = QInputDialog.getText(self, "이름변경", "새 이름", text=current_name)
+        if not ok or not new_name.strip() or new_name.strip() == current_name:
+            return
+        new_name = new_name.strip()
+        if _INVALID_NAME_CHARS.search(new_name):
+            self._show_error(AppError("E-4005", detail=new_name))
+            return
+        client = self._client
+        bucket = self._current_bucket
+        submit(
+            self._pool,
+            self._workers,
+            expand_rename_items,
+            client,
+            bucket,
+            entry,
+            new_name,
+            on_result=lambda items: self._run_transfer("이름변경", items),
             on_error=self._show_error,
         )
 
@@ -320,6 +434,40 @@ class MainWindow(QMainWindow):
             self._reload_profile_combo()
             if self._store.active_profile:
                 self._connect_profile(self._store.active_profile)
+
+    # ---- 관리자 모드 (5.2) -------------------------------------------------
+
+    def _on_toggle_superuser(self, checked: bool) -> None:
+        if checked:
+            password, ok = QInputDialog.getText(
+                self, "관리자 모드", "비밀번호", QLineEdit.EchoMode.Password
+            )
+            if not ok:
+                self._revert_superuser_action(False)
+                return
+            try:
+                permissions.enable_superuser(password)
+            except ValueError:
+                QMessageBox.warning(self, "관리자 모드", "비밀번호가 올바르지 않습니다.")
+                self._revert_superuser_action(False)
+                return
+        else:
+            permissions.disable_superuser()  # 5.2: 해제는 비밀번호 없이 가능
+        self._apply_permission_mode()
+
+    def _revert_superuser_action(self, checked: bool) -> None:
+        self.superuser_action.blockSignals(True)
+        self.superuser_action.setChecked(checked)
+        self.superuser_action.blockSignals(False)
+
+    def _apply_permission_mode(self) -> None:
+        self.superuser_badge.setVisible(permissions.is_superuser())
+        if self._client is None or not self._current_bucket:
+            return
+        root = permissions.root_prefix()
+        self._current_prefix = root
+        self.tree_panel.set_client(self._client, bucket=self._current_bucket, root_prefix=root)
+        self.object_table.load(self._current_bucket, root)
 
     # ---- 오류 표시 (10.4) ---------------------------------------------------
 

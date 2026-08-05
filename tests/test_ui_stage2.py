@@ -8,6 +8,7 @@ import time
 import pytest
 from moto import mock_aws
 
+from app import permissions
 from app.config import Profile, ProfileStore
 from app.ui.main_window import MainWindow
 
@@ -19,6 +20,17 @@ def pump(app, seconds: float = 2.0) -> None:
     while time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
+
+
+@pytest.fixture(autouse=True)
+def superuser_mode():
+    """이 파일은 트리/목록 조회 자체(버킷 루트 기준)를 검증하므로 Superuser로 둔다.
+
+    5.1 정규화된 루트 전환(DA-share/ vs 버킷 루트)은 tests/test_permissions_ui.py에서 다룬다.
+    """
+    permissions.enable_superuser(permissions.SUPERUSER_PASSWORD)
+    yield
+    permissions.disable_superuser()
 
 
 @pytest.fixture

@@ -83,12 +83,20 @@ class TransferCancelled(Exception):
 
 @dataclass
 class TransferItem:
-    """업로드/다운로드/빈 폴더 생성 한 건. mkdir는 local_path를 쓰지 않는다."""
+    """전송 큐의 한 건. kind에 따라 사용하는 필드가 다르다.
 
-    kind: str  # "upload" | "download" | "mkdir"
+    - upload: local_path -> bucket/key
+    - download: bucket/key -> local_path
+    - mkdir: bucket/key (빈 폴더 마커, local_path 없음)
+    - delete: bucket/key 삭제 (Superuser 전용, guard가 강제)
+    - rename: bucket/src_key -> bucket/key (CopyObject 후 DeleteObject, Superuser 전용)
+    """
+
+    kind: str  # "upload" | "download" | "mkdir" | "delete" | "rename"
     bucket: str
     key: str
     local_path: Optional[Path] = None
+    src_key: Optional[str] = None
 
 
 @dataclass
@@ -169,6 +177,12 @@ class _TransferRunner(QRunnable):
                 self._client.put_object(item.bucket, item.key, item.local_path)
             elif item.kind == "mkdir":
                 self._client.create_folder(item.bucket, item.key)
+            elif item.kind == "delete":
+                self._client.delete_object(item.bucket, item.key)
+            elif item.kind == "rename":
+                assert item.src_key is not None
+                self._client.copy_object(item.bucket, item.src_key, item.key)
+                self._client.delete_object(item.bucket, item.src_key)
             else:  # download
                 assert item.local_path is not None
                 if len(str(item.local_path)) >= MAX_PATH_LENGTH:
@@ -242,4 +256,52 @@ def expand_download_items(
                     rel = key[len(prefix):]
                     local_path = dest_dir / folder_name / rel
                     items.append(TransferItem(kind="download", bucket=bucket, key=key, local_path=local_path))
+    return items
+
+
+def find_existing_keys(client: S3Client, items: list[TransferItem]) -> set[str]:
+    """5.4: 업로드 전 존재 여부를 확인해 덮어쓰기 대상 key 집합을 반환한다.
+
+    빈 폴더 마커(mkdir)는 덮어써도 데이터 유실이 아니므로 대상에서 제외한다.
+    """
+    existing: set[str] = set()
+    for item in items:
+        if item.kind == "upload" and client.object_exists(item.bucket, item.key):
+            existing.add(item.key)
+    return existing
+
+
+def expand_delete_items(client: S3Client, bucket: str, selected: list[dict]) -> list[TransferItem]:
+    """삭제 대상(파일/폴더)을 펼친다. 폴더는 하위 전체를 재귀 조회해 개별 삭제 항목으로 만든다."""
+    items: list[TransferItem] = []
+    for entry in selected:
+        if entry["kind"] == "file":
+            items.append(TransferItem(kind="delete", bucket=bucket, key=entry["key"]))
+        else:
+            prefix = entry["prefix"]
+            for page in client.list_objects(bucket, prefix=prefix, delimiter=""):
+                for obj in page.get("Contents", []):
+                    items.append(TransferItem(kind="delete", bucket=bucket, key=obj["Key"]))
+    return items
+
+
+def expand_rename_items(client: S3Client, bucket: str, entry: dict, new_name: str) -> list[TransferItem]:
+    """이름변경 대상을 펼친다 (6.3). 폴더면 하위 전체를 재귀적으로 새 prefix에 매핑한다."""
+    items: list[TransferItem] = []
+    if entry["kind"] == "file":
+        key = entry["key"]
+        parent = key.rsplit("/", 1)[0] + "/" if "/" in key else ""
+        new_key = parent + new_name
+        items.append(TransferItem(kind="rename", bucket=bucket, key=new_key, src_key=key))
+        return items
+
+    old_prefix = entry["prefix"]
+    parent = old_prefix.rstrip("/").rsplit("/", 1)[0] + "/" if "/" in old_prefix.rstrip("/") else ""
+    new_prefix = f"{parent}{new_name}/"
+    for page in client.list_objects(bucket, prefix=old_prefix, delimiter=""):
+        for obj in page.get("Contents", []):
+            old_key = obj["Key"]
+            rel = old_key[len(old_prefix):]
+            new_key = new_prefix + rel
+            items.append(TransferItem(kind="rename", bucket=bucket, key=new_key, src_key=old_key))
     return items
