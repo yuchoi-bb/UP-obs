@@ -53,13 +53,20 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           mv "dist/UP-obs.exe" "dist/UP-obs-v${VERSION}.exe"
 
-      - name: Create GitHub Release
+      # 태그를 git push로 만들었으면 릴리즈가 아직 없어 새로 만들고, GitHub UI에서
+      # "Publish release"로 태그+릴리즈를 함께 만들었으면 이미 릴리즈가 있으므로
+      # 자산만 업로드한다 (gh release create는 기존 릴리즈가 있으면 실패함).
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release create "${{ github.ref_name }}" \
-            "dist/UP-obs-v${VERSION}.exe" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes
+          ASSET="dist/UP-obs-v${VERSION}.exe"
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" "$ASSET" --clobber
+          else
+            gh release create "${{ github.ref_name }}" "$ASSET" \
+              --title "${{ github.ref_name }}" \
+              --generate-notes
+          fi
