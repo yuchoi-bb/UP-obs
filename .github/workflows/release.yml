@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - 'v*'
+  # 태그 없이 수동으로 빌드만 돌리고 싶을 때 사용한다. 결과물은 Actions
+  # 아티팩트로만 올라가고 릴리즈는 자동으로 만들지 않는다 — GitHub의 "불변
+  # 릴리즈" 정책 때문에 릴리즈를 먼저 발행(Publish)한 뒤에는 자산을 나중에
+  # 붙일 수 없으므로, 다운로드한 exe를 릴리즈 발행 화면에 직접 첨부해서
+  # 태그 생성과 자산 첨부가 한 번에 일어나도록 해야 한다.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '버전 (예: 0.1.1). 파일 이름과 __version__에 쓰인다.'
+        required: true
+        type: string
 
 jobs:
   build:
@@ -25,13 +36,23 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # 11.3: __version__은 빌드 시 태그에서 주입한다. 태그와 어긋나면 업데이트
-      # 배너가 무한 반복되므로 반드시 일치시켜야 한다.
-      - name: Inject version from tag
+      - name: Determine version
+        id: version
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "__version__ = \"$VERSION\"" > app/version.py
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # 11.3: __version__은 빌드 시 주입한다. 태그와 어긋나면 업데이트 배너가
+      # 무한 반복되므로 반드시 일치시켜야 한다.
+      - name: Inject version
+        shell: bash
+        run: |
+          echo "__version__ = \"${{ steps.version.outputs.version }}\"" > app/version.py
           cat app/version.py
 
       # 12.2: 아이콘은 아직 확보되지 않았다 (REQUIREMENTS.md 15장 미결 사항).
@@ -49,21 +70,34 @@ jobs:
 
       - name: Rename artifact
         shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mv "dist/UP-obs.exe" "dist/UP-obs-v${VERSION}.exe"
+        run: mv "dist/UP-obs.exe" "dist/UP-obs-v${{ steps.version.outputs.version }}.exe"
 
-      # 태그를 git push로 만들었으면 릴리즈가 아직 없어 새로 만들고, GitHub UI에서
-      # "Publish release"로 태그+릴리즈를 함께 만들었으면 이미 릴리즈가 있으므로
-      # 자산만 업로드한다 (gh release create는 기존 릴리즈가 있으면 실패함).
-      - name: Create or update GitHub Release
+      # 트리거 종류와 상관없이 항상 Actions 아티팩트로 올린다. workflow_dispatch로
+      # 돌렸을 때 이 아티팩트를 내려받아 릴리즈 발행 화면에 직접 첨부하면 된다.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UP-obs-v${{ steps.version.outputs.version }}
+          path: dist/UP-obs-v${{ steps.version.outputs.version }}.exe
+          retention-days: 30
+
+      # 11.1 원래 설계: v* 태그 push -> 자동 릴리즈. workflow_dispatch(수동
+      # 빌드)일 때는 릴리즈를 건드리지 않는다.
+      #
+      # 이미 같은 태그로 릴리즈가 발행되어 있으면(GitHub UI에서 먼저
+      # "Publish"한 경우) 이 단계는 실패한다 — 불변 릴리즈 정책 때문에 발행된
+      # 릴리즈에는 자산을 나중에 붙일 수 없다(HTTP 422). 그 경우 빈 릴리즈를
+      # 지우고 태그만 다시 push하거나, workflow_dispatch로 빌드해 받은 파일을
+      # 릴리즈 발행 시점에 직접 첨부해야 한다.
+      - name: Create GitHub Release (tag push only)
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          ASSET="dist/UP-obs-v${VERSION}.exe"
+          ASSET="dist/UP-obs-v${{ steps.version.outputs.version }}.exe"
           if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            echo "::warning::릴리즈 '${{ github.ref_name }}'가 이미 있어 자산 첨부를 시도합니다. 불변 릴리즈 정책으로 실패할 수 있습니다."
             gh release upload "${{ github.ref_name }}" "$ASSET" --clobber
           else
             gh release create "${{ github.ref_name }}" "$ASSET" \
